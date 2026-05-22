@@ -65,6 +65,37 @@ test("serves files from assets directory", async ({ expect }) => {
 	expect(await res.text()).toBe("hello from asset");
 });
 
+test("routes named workers with assets through ingress", async ({ expect }) => {
+	const tmp = await useTmp();
+	await fs.writeFile(path.join(tmp, "test.txt"), "hello from asset");
+
+	const mf = new Miniflare({
+		workers: [
+			{
+				name: "app",
+				routes: ["http://example.com/*"],
+				...makeOptions(tmp),
+			},
+			{
+				name: "api",
+				modules: true,
+				script: WORKER_SCRIPT,
+				compatibilityDate: "2026-04-29",
+			},
+		],
+	});
+	useDispose(mf);
+
+	const routedResponse = await mf.dispatchFetch("http://example.com/test.txt");
+	expect(routedResponse.status).toBe(200);
+	expect(await routedResponse.text()).toBe("hello from asset");
+
+	const app = await mf.getWorker("app");
+	const workerResponse = await app.fetch("http://example.com/test.txt");
+	expect(workerResponse.status).toBe(200);
+	expect(await workerResponse.text()).toBe("from user worker");
+});
+
 // ─── Watch / reload behaviour ────────────────────────────────────────────────
 
 // This test simulates what happens during `wrangler dev` when the assets

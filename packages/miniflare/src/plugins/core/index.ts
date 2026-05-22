@@ -17,13 +17,17 @@ import { DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE } from "@cloudflare/containe
 import { getTodaysCompatDate, removeDirSync } from "@cloudflare/workers-utils";
 import { MockAgent } from "undici";
 import SCRIPT_ENTRY from "worker:core/entry";
+import SCRIPT_INGRESS from "worker:core/ingress";
 import STRIP_CF_CONNECTING_IP from "worker:core/strip-cf-connecting-ip";
 import { z } from "zod";
 import { fetch } from "../../http";
 import { kVoid } from "../../runtime";
 import { JsonSchema, Log, MiniflareCoreError, PathSchema } from "../../shared";
 import { CoreBindings, CoreHeaders, viewToBuffer } from "../../workers";
-import { RPC_PROXY_SERVICE_NAME } from "../assets/constants";
+import {
+	ROUTER_SERVICE_NAME,
+	RPC_PROXY_SERVICE_NAME,
+} from "../assets/constants";
 import { getCacheServiceName } from "../cache";
 import { DURABLE_OBJECTS_STORAGE_SERVICE_NAME } from "../do";
 import { IMAGES_PLUGIN_NAME } from "../images";
@@ -43,6 +47,7 @@ import {
 	getBuiltinServiceName,
 	getCustomFetchServiceName,
 	getCustomNodeServiceName,
+	getIngressServiceName,
 	getUserServiceName,
 	SERVICE_ENTRY,
 	SERVICE_LOCAL_EXPLORER,
@@ -154,6 +159,7 @@ const CoreOptionsSchemaInput = z.intersection(
 		unsafeInspectorProxy: z.boolean().optional(),
 
 		routes: z.string().array().optional(),
+		upstream: z.string().optional(),
 
 		bindings: z.record(JsonSchema).optional(),
 		wasmBindings: z
@@ -1015,7 +1021,7 @@ export interface GlobalServicesOptions {
 	/** Pass Workflow configuration for the explorer worker */
 	workflowOptions?: Map<string, WorkflowOption>;
 	/** All worker options for building per-worker resource bindings */
-	allWorkerOpts?: PluginWorkerOptions[];
+	allWorkerOpts: PluginWorkerOptions[];
 }
 export function getGlobalServices({
 	sharedOptions,
@@ -1038,19 +1044,19 @@ export function getGlobalServices({
 		WORKER_BINDING_SERVICE_LOOPBACK, // For converting stack-traces to pretty-error pages
 		{ name: CoreBindings.JSON_ROUTES, json: JSON.stringify(routes) },
 		{
-			name: CoreBindings.TRIGGER_HANDLERS,
-			json: JSON.stringify(!!sharedOptions.unsafeTriggerHandlers),
-		},
-		{
 			name: CoreBindings.LOG_REQUESTS,
 			json: JSON.stringify(!!sharedOptions.logRequests),
 		},
 		{ name: CoreBindings.JSON_CF_BLOB, json: JSON.stringify(sharedOptions.cf) },
 		{ name: CoreBindings.JSON_LOG_LEVEL, json: JSON.stringify(log.level) },
 		{
-			name: CoreBindings.SERVICE_USER_FALLBACK,
+			name: CoreBindings.SERVICE_INGRESS_FALLBACK,
 			service: { name: fallbackWorkerName },
 		},
+		...workerNames.map((name) => ({
+			name: CoreBindings.SERVICE_INGRESS_ROUTE_PREFIX + name,
+			service: { name: getIngressServiceName(name) },
+		})),
 		...workerNames.map((name) => ({
 			name: CoreBindings.SERVICE_USER_ROUTE_PREFIX + name,
 			service: { name: getUserServiceName(name) },
@@ -1179,6 +1185,63 @@ export function getGlobalServices({
 			},
 		},
 	];
+
+	for (const worker of allWorkerOpts) {
+		if (!workerNames.includes(worker.core.name ?? "")) {
+			continue;
+		}
+
+		const serviceName = getUserServiceName(worker.core.name);
+		const fetchTargetServiceName = worker.core.unsafeOverrideFetchWorker
+			? getUserServiceName(worker.core.unsafeOverrideFetchWorker)
+			: worker.assets.assets
+				? `${ROUTER_SERVICE_NAME}:${worker.assets.assets.workerName}`
+				: serviceName;
+		const upstream = worker.core.upstream ?? sharedOptions.upstream;
+		const bindings: Worker_Binding[] = [
+			WORKER_BINDING_SERVICE_LOOPBACK,
+			{
+				name: CoreBindings.SERVICE_WORKER_FETCH_TARGET,
+				service: { name: fetchTargetServiceName },
+			},
+			{
+				name: CoreBindings.SERVICE_WORKER_RPC_TARGET,
+				service: { name: serviceName },
+			},
+			{
+				name: CoreBindings.TRIGGER_HANDLERS,
+				json: JSON.stringify(!!sharedOptions.unsafeTriggerHandlers),
+			},
+			{
+				name: CoreBindings.STRIP_DISABLE_PRETTY_ERROR,
+				json: JSON.stringify(sharedOptions.stripDisablePrettyError),
+			},
+		];
+
+		if (upstream !== undefined) {
+			bindings.push({
+				name: CoreBindings.TEXT_UPSTREAM_URL,
+				text: upstream,
+			});
+		}
+
+		if (sharedOptions.unsafeProxySharedSecret !== undefined) {
+			bindings.push({
+				name: CoreBindings.DATA_PROXY_SHARED_SECRET,
+				data: encoder.encode(sharedOptions.unsafeProxySharedSecret),
+			});
+		}
+
+		services.push({
+			name: getIngressServiceName(worker.core.name),
+			worker: {
+				modules: [{ name: "ingress.worker.js", esModule: SCRIPT_INGRESS() }],
+				compatibilityDate: "2025-03-17",
+				compatibilityFlags: ["nodejs_compat", "service_binding_extra_handlers"],
+				bindings,
+			},
+		});
+	}
 
 	if (sharedOptions.unsafeLocalExplorer) {
 		const localExplorerUiPath = resolveLocalExplorerUi(tmpPath);
